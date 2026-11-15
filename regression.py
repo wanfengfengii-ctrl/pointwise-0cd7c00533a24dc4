@@ -125,9 +125,81 @@ BEGIN SELECT RAISE(ABORT, 'COMMIT_INJECTED'); END;
         assert db.execute("SELECT COUNT(*) FROM ledger").fetchone() == (0,)
         assert db.execute("SELECT state FROM jobs").fetchone() == ("running",)
         db.execute("DROP TRIGGER fail_accounting")
+    # Commit failure leaves the retryable state and no new scratch files.
+    assert sorted(p.name for p in (root / "inputs").iterdir()) == ["sample.json"]
+    assert sorted(p.name for p in (root / "work").iterdir()) == ["sample.jsonl"]
     assert bench.collect(root, raw, meta)
     bench.assert_result(root, "retry", meta)
     return "READ_AND_COMMIT_RETRY_OK"
+
+
+def assert_handoff_clean(root, name):
+    # Only the durable handoff files remain; scratch stores and partial
+    # canonical temporaries are always cleaned up.
+    assert sorted(p.name for p in (Path(root) / "inputs").iterdir()) == [name + ".json"]
+    assert sorted(p.name for p in (Path(root) / "work").iterdir()) == [name + ".jsonl"]
+
+
+def recovered(folder):
+    # A rejected download leaves the store ready for a good retry.
+    folder.mkdir()
+    root = folder / "data"
+    bench.initialize(root)
+    bad = checks.small()
+    bad["rows"].append({"id": "z", "rev": 1, "station": "east"})
+    raw = folder / "bad.json"
+    raw.write_text(json.dumps(bad), encoding="utf-8")
+    bad_meta = {"length": raw.stat().st_size, "raw_sha256": bench.digest(raw)}
+    collector.enqueue(root, "bad", "http://fixture/export")
+    assert bench.collect(root, raw, bad_meta)
+    assert collector.status(root)[0]["state"] == "failed"
+    assert not runtime.status(root)
+    with runtime.connect(root) as db:
+        assert db.execute("SELECT COUNT(*) FROM ledger").fetchone() == (0,)
+    good = folder / "good.json"
+    good.write_text(json.dumps(checks.small()), encoding="utf-8")
+    meta = bench.prepare(good, folder)
+    collector.enqueue(root, "good", "http://fixture/export")
+    assert bench.collect(root, good, meta)
+    bench.assert_result(root, "good", meta)
+    assert_handoff_clean(root, "sample")
+    return "RECOVERY_OK"
+
+
+def boundary(base):
+    base.mkdir()
+    # Invalid tail rows must not be accepted; a valid prefix stays uncommitted.
+    tail = checks.small()
+    tail["rows"].append({"id": "z", "rev": 1, "station": "east"})
+    rejected(base / "invalid_tail", json.dumps(tail), "ROW")
+    conflict = checks.small()
+    conflict["rows"].append(dict(conflict["rows"][0], value=12345))
+    rejected(base / "tail_conflict", json.dumps(conflict), "REVISION_CONFLICT")
+    # Differential edges vs the frozen reference: tombstone then resurrect,
+    # zero-sum non-empty groups, arbitrary precision integers, exact
+    # duplicate rows, non-ASCII identities.
+    edge = {"batch_id": "edge", "scale": 100, "rows": [
+        {"id": "a", "rev": 1, "station": "s", "minute": 0, "value": 1, "deleted": False},
+        {"id": "a", "rev": 2, "station": "s", "minute": 0, "value": 2, "deleted": True},
+        {"id": "a", "rev": 3, "station": "s", "minute": 0, "value": 7, "deleted": False},
+        {"id": "b", "rev": 1, "station": "s", "minute": 0, "value": -7, "deleted": False},
+        {"id": "c", "rev": 2 ** 80, "station": "站", "minute": -(2 ** 70),
+         "value": 2 ** 100, "deleted": False},
+        {"id": "c", "rev": 2 ** 80, "station": "站", "minute": -(2 ** 70),
+         "value": 2 ** 100, "deleted": False},
+        {"id": "d", "rev": 1, "station": "s", "minute": 0, "value": 3, "deleted": True},
+    ]}
+    ordinary(base / "edge", json.dumps(edge, ensure_ascii=False))
+    assert_handoff_clean(base / "edge" / "data", "edge")
+    # Overridden members: only the last rows array is validated and accepted,
+    # earlier rows arrays still must be syntactically complete.
+    overridden = ('{"rows":[{"bad":0}],"scale":false,"batch_id":"wrong","rows":'
+                  + json.dumps(edge["rows"], ensure_ascii=False)
+                  + ',"scale":5,"batch_id":"edge2"}')
+    ordinary(base / "overridden", overridden)
+    assert_handoff_clean(base / "overridden" / "data", "edge2")
+    recovered(base / "recovered")
+    return "BOUNDARY_OK"
 
 
 def integration():
@@ -163,7 +235,8 @@ def integration():
         bad["rows"].append(dict(bad["rows"][0], value=True))
         rejected(base / "boolean", json.dumps(bad), "NUMBER")
         retry = failure_retry(base / "retry")
-    return {"marker": "INTEGRATION_OK", "retry": retry}
+        edges = boundary(base / "boundary")
+    return {"marker": "INTEGRATION_OK", "retry": retry, "boundary": edges}
 
 
 def verify(mode):

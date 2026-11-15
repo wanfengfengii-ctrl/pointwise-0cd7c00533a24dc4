@@ -6,7 +6,7 @@
     "python3",
     "-B",
     "regression.py",
-    "baseline"
+    "target"
   ],
   "demo": [
     "python3",

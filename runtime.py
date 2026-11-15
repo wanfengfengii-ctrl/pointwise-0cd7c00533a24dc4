@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 import time
 
+import pipeline
 from pipeline import encode, receipt, stage, summarize, validate
 
 
@@ -92,6 +93,61 @@ def submit(root, batch):
     return {"accepted": name, "input_sha256": digest}
 
 
+def submit_file(root, raw_path):
+    """File handoff acceptance: stream-validate the downloaded document,
+    persist canonical input bytes identical to encode(batch), and enqueue
+    the batch only after the whole document verifies. Same idempotence,
+    conflicts, and accounting boundaries as submit()."""
+    root = Path(root)
+    versions = pipeline.Versions(root / "work")
+    temporary = None
+    try:
+        with pipeline.open_text(raw_path) as text:
+            layout = pipeline.scan_layout(text)
+        name, scale = pipeline.validate_head(layout)
+        destination = root / "inputs" / (name + ".json")
+        temporary = destination.with_suffix(".incoming")
+        digest = hashlib.sha256()
+        with temporary.open("wb") as target:
+            def emit(chunk):
+                digest.update(chunk)
+                target.write(chunk)
+            emit(b'{"batch_id":' + pipeline.canonical_bytes(name) + b',"rows":[')
+            count = [0]
+
+            def sink(line):
+                if count[0]:
+                    emit(b",")
+                count[0] += 1
+                emit(line)
+            pipeline.absorb_rows(raw_path, layout, versions, sink)
+            emit(b'],"scale":' + pipeline.canonical_bytes(scale) + b"}\n")
+            target.flush()
+            os.fsync(target.fileno())
+        digest = digest.hexdigest()
+        with connect(root) as db:
+            db.execute("BEGIN IMMEDIATE")
+            old = db.execute("SELECT digest FROM jobs WHERE id=?", (name,)).fetchone()
+            if old:
+                if old[0] != digest:
+                    raise ValueError("BATCH_CONFLICT")
+                return {"accepted": name, "input_sha256": digest}
+            if db.execute("SELECT 1 FROM jobs WHERE state != 'completed'").fetchone():
+                raise ValueError("ACTIVE_BATCH")
+            os.replace(temporary, destination)
+            sync_directory(destination.parent)
+            temporary = None
+            db.execute("INSERT INTO jobs(id,digest,state) VALUES(?,?,'pending')", (name, digest))
+        return {"accepted": name, "input_sha256": digest}
+    finally:
+        versions.cleanup()
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
 def commit_result(db, name, result, ack, path):
     # Existing atomic accounting boundary, intentionally separate from file I/O.
     with db:
@@ -109,15 +165,23 @@ def run_one(root):
             return False
         name, digest = job
         db.execute("UPDATE jobs SET state='running' WHERE id=?", (name,))
-    batch = json.loads((root / "inputs" / (name + ".json")).read_bytes())
+    source = root / "inputs" / (name + ".json")
     intermediate = root / "work" / (name + ".jsonl")
     barrier(root, "stage")
-    with intermediate.open("wb") as target:
-        stage(batch, target)
-        target.flush()
-        os.fsync(target.fileno())
-    with intermediate.open("rb") as source:
-        result = encode(summarize(source))
+    versions = pipeline.Versions(root / "work")
+    try:
+        with pipeline.open_text(source) as text:
+            layout = pipeline.scan_layout(text)
+        _, scale = pipeline.validate_head(layout)
+        pipeline.absorb_rows(source, layout, versions)
+        with intermediate.open("wb") as target:
+            pipeline.stage_versions(versions, scale, target)
+            target.flush()
+            os.fsync(target.fileno())
+    finally:
+        versions.cleanup()
+    with intermediate.open("rb") as staged:
+        result = encode(summarize(staged))
     destination = root / "results" / (name + ".json")
     barrier(root, "result")
     with destination.open("wb") as target:

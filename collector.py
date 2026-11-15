@@ -107,12 +107,11 @@ def run_one(root):
         os.replace(temporary, complete)
         runtime.sync_directory(complete.parent)
         runtime.barrier(root, "verified")
-        batch = json.loads(complete.read_bytes())
-        runtime.submit(root, batch)
+        accepted = runtime.submit_file(root, complete)
         runtime.barrier(root, "accepted")
         runtime.run_one(root)
         runtime.barrier(root, "accounted")
-        result = runtime.read(root, batch["batch_id"])
+        result = runtime.read(root, accepted["accepted"])
         if not result["available"]:
             raise ValueError("NOT_ACCOUNTED")
         with runtime.connect(root) as db:
